@@ -46,9 +46,13 @@
 
             <ProgressBar x:Name="ProgressBar" Height="20" Margin="0,12,0,8" IsIndeterminate="False"/>
 
+            <TextBlock x:Name="StatusTextBlock" Text="待機中" Margin="0,0,0,8"/>
+
             <StackPanel Orientation="Horizontal" Margin="0,8,0,8">
                 <TextBlock Text="変換前: " VerticalAlignment="Center" FontWeight="Bold"/>
                 <TextBlock x:Name="InputSizeTextBlock" Text="-" VerticalAlignment="Center" Margin="4,0,16,0"/>
+                <TextBlock Text="動画長: " VerticalAlignment="Center" FontWeight="Bold"/>
+                <TextBlock x:Name="DurationTextBlock" Text="-" VerticalAlignment="Center" Margin="4,0,16,0"/>
                 <TextBlock Text="変換後: " VerticalAlignment="Center" FontWeight="Bold"/>
                 <TextBlock x:Name="OutputSizeTextBlock" Text="-" VerticalAlignment="Center" Margin="4,0,0,0"/>
             </StackPanel>

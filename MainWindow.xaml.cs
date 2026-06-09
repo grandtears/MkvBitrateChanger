@@ -1,6 +1,8 @@
 ﻿using Microsoft.Win32;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Threading.Tasks;
@@ -11,12 +13,16 @@ namespace MkvBitrateChanger
 {
     public partial class MainWindow : Window
     {
+        private const int MaxLogLines = 300;
+        private readonly Queue<string> logLines = new Queue<string>();
+        private DateTime lastProgressUpdateUtc = DateTime.MinValue;
+
         public MainWindow()
         {
             InitializeComponent();
         }
 
-        private void SelectInput_Click(object sender, RoutedEventArgs e)
+        private async void SelectInput_Click(object sender, RoutedEventArgs e)
         {
             var dialog = new OpenFileDialog
             {
@@ -30,6 +36,8 @@ namespace MkvBitrateChanger
                 var dir = Path.GetDirectoryName(dialog.FileName)!;
                 var name = Path.GetFileNameWithoutExtension(dialog.FileName);
                 OutputPathTextBox.Text = Path.Combine(dir, $"{name}_converted.mkv");
+
+                await UpdateInputMetadata();
             }
         }
 
@@ -51,8 +59,11 @@ namespace MkvBitrateChanger
         {
             StartButton.IsEnabled = false;
             LogTextBox.Clear();
+            logLines.Clear();
             InputSizeTextBlock.Text = "-";
+            DurationTextBlock.Text = "-";
             OutputSizeTextBlock.Text = "-";
+            StatusTextBlock.Text = "待機中";
 
             try
             {
@@ -67,10 +78,6 @@ namespace MkvBitrateChanger
                     MessageBox.Show("出力先を指定してください。");
                     return;
                 }
-
-                // Display input file size
-                var inputFileInfo = new FileInfo(InputPathTextBox.Text);
-                InputSizeTextBlock.Text = FormatFileSize(inputFileInfo.Length);
 
                 if (!await IsCommandAvailable("ffmpeg"))
                 {
@@ -96,12 +103,15 @@ namespace MkvBitrateChanger
                     }
                 }
 
+                await UpdateInputMetadata();
+
                 string args = BuildFfmpegArgs();
 
                 AppendLog("ffmpeg " + args);
                 AppendLog("");
 
                 ProgressBar.IsIndeterminate = true;
+                StatusTextBlock.Text = "変換中...";
 
                 int exitCode = await RunProcess("ffmpeg", args);
 
@@ -112,11 +122,13 @@ namespace MkvBitrateChanger
                     // Display output file size
                     var outputFileInfo = new FileInfo(OutputPathTextBox.Text);
                     OutputSizeTextBlock.Text = FormatFileSize(outputFileInfo.Length);
+                    StatusTextBlock.Text = "完了";
 
                     MessageBox.Show("変換が完了しました。");
                 }
                 else
                 {
+                    StatusTextBlock.Text = "失敗";
                     MessageBox.Show("変換に失敗しました。ログを確認してください。");
                 }
             }
@@ -142,6 +154,50 @@ namespace MkvBitrateChanger
             return $"{len:F2} {sizes[order]}";
         }
 
+        private async Task UpdateInputMetadata()
+        {
+            if (!File.Exists(InputPathTextBox.Text))
+            {
+                InputSizeTextBlock.Text = "-";
+                DurationTextBlock.Text = "-";
+                return;
+            }
+
+            var inputFileInfo = new FileInfo(InputPathTextBox.Text);
+            InputSizeTextBlock.Text = FormatFileSize(inputFileInfo.Length);
+            DurationTextBlock.Text = await GetVideoDuration(InputPathTextBox.Text);
+        }
+
+        private async Task<string> GetVideoDuration(string inputPath)
+        {
+            if (!await IsCommandAvailable("ffprobe"))
+            {
+                return "-";
+            }
+
+            string args = $"-v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"{inputPath}\"";
+            var result = await RunProcessCapture("ffprobe", args);
+            string durationText = result.Output.Trim();
+
+            if (result.ExitCode == 0 &&
+                double.TryParse(durationText, NumberStyles.Float, CultureInfo.InvariantCulture, out double seconds))
+            {
+                return FormatDuration(TimeSpan.FromSeconds(seconds));
+            }
+
+            return "-";
+        }
+
+        private string FormatDuration(TimeSpan duration)
+        {
+            if (duration.TotalHours >= 1)
+            {
+                return $"{(int)duration.TotalHours}:{duration.Minutes:D2}:{duration.Seconds:D2}";
+            }
+
+            return $"{duration.Minutes:D2}:{duration.Seconds:D2}";
+        }
+
         private string BuildFfmpegArgs()
         {
             string input = InputPathTextBox.Text;
@@ -149,11 +205,12 @@ namespace MkvBitrateChanger
 
             string codec = UseH265CheckBox.IsChecked == true ? "libx265" : "libx264";
             string preset = ((ComboBoxItem)PresetComboBox.SelectedItem).Content.ToString()!;
+            int encoderThreads = GetEncoderThreadCount();
 
             var sb = new StringBuilder();
 
-            sb.Append($"-y -i \"{input}\" ");
-            sb.Append($"-c:v {codec} ");
+            sb.Append($"-y -hide_banner -nostdin -stats_period 5 -i \"{input}\" ");
+            sb.Append($"-c:v {codec} -threads {encoderThreads} ");
 
             if (CrfRadio.IsChecked == true)
             {
@@ -171,6 +228,11 @@ namespace MkvBitrateChanger
             sb.Append($"\"{output}\"");
 
             return sb.ToString();
+        }
+
+        private int GetEncoderThreadCount()
+        {
+            return Math.Max(1, Environment.ProcessorCount - 2);
         }
 
         private async Task<bool> IsCommandAvailable(string command)
@@ -208,32 +270,12 @@ namespace MkvBitrateChanger
 
             process.OutputDataReceived += (_, e) =>
             {
-                if (logOutput && e.Data != null)
-                {
-                    // Filter output: only log important messages, not every frame
-                    if (ShouldLogLine(e.Data, ref lineCount))
-                    {
-                        Dispatcher.Invoke(() => AppendLog(e.Data), System.Windows.Threading.DispatcherPriority.Background);
-                    }
-                    
-                    // Update progress bar with ffmpeg progress information
-                    UpdateProgressFromFfmpeg(e.Data);
-                }
+                HandleProcessLine(e.Data, logOutput, ref lineCount);
             };
 
             process.ErrorDataReceived += (_, e) =>
             {
-                if (logOutput && e.Data != null)
-                {
-                    // Filter output: only log important messages
-                    if (ShouldLogLine(e.Data, ref lineCount))
-                    {
-                        Dispatcher.Invoke(() => AppendLog(e.Data), System.Windows.Threading.DispatcherPriority.Background);
-                    }
-                    
-                    // Update progress bar with ffmpeg progress information
-                    UpdateProgressFromFfmpeg(e.Data);
-                }
+                HandleProcessLine(e.Data, logOutput, ref lineCount);
             };
 
             process.Exited += (_, _) =>
@@ -256,6 +298,52 @@ namespace MkvBitrateChanger
             return await tcs.Task;
         }
 
+        private async Task<(int ExitCode, string Output)> RunProcessCapture(string fileName, string arguments)
+        {
+            using var process = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = fileName,
+                    Arguments = arguments,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                }
+            };
+
+            try
+            {
+                process.Start();
+            }
+            catch
+            {
+                return (-1, string.Empty);
+            }
+
+            string output = await process.StandardOutput.ReadToEndAsync();
+            await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+
+            return (process.ExitCode, output);
+        }
+
+        private void HandleProcessLine(string? data, bool logOutput, ref int lineCount)
+        {
+            if (!logOutput || data == null)
+            {
+                return;
+            }
+
+            UpdateProgressFromFfmpeg(data);
+
+            if (ShouldLogLine(data, ref lineCount))
+            {
+                Dispatcher.BeginInvoke(() => AppendLog(data), System.Windows.Threading.DispatcherPriority.Background);
+            }
+        }
+
         private bool ShouldLogLine(string data, ref int lineCount)
         {
             // Log every 10th line to reduce UI updates
@@ -263,10 +351,14 @@ namespace MkvBitrateChanger
             
             // Always log important messages
             if (data.Contains("error", StringComparison.OrdinalIgnoreCase) ||
-                data.Contains("warning", StringComparison.OrdinalIgnoreCase) ||
-                data.Contains("frame=", StringComparison.OrdinalIgnoreCase))
+                data.Contains("warning", StringComparison.OrdinalIgnoreCase))
             {
                 return true;
+            }
+
+            if (data.Contains("frame=", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
             }
             
             // Log periodically to show progress
@@ -275,21 +367,32 @@ namespace MkvBitrateChanger
 
         private void UpdateProgressFromFfmpeg(string data)
         {
-            // Extract frame information from ffmpeg output for progress indication
-            // Format: frame= 1234 fps= 45 q=-1.0 Lsize=   1234kB time=00:00:27.48 bitrate=367.8kbps speed=1.5x
             if (data.Contains("frame="))
             {
                 try
                 {
-                    // Simple heuristic: update progress based on time output
+                    var now = DateTime.UtcNow;
+                    if (now - lastProgressUpdateUtc < TimeSpan.FromSeconds(1))
+                    {
+                        return;
+                    }
+
+                    lastProgressUpdateUtc = now;
                     var timeMatch = System.Text.RegularExpressions.Regex.Match(data, @"time=(\d+):(\d+):(\d+\.\d+)");
+                    var speedMatch = System.Text.RegularExpressions.Regex.Match(data, @"speed=\s*([^\s]+)");
                     if (timeMatch.Success)
                     {
-                        Dispatcher.Invoke(() =>
+                        string status = $"変換中... {timeMatch.Value}";
+                        if (speedMatch.Success)
+                        {
+                            status += $" {speedMatch.Value}";
+                        }
+
+                        Dispatcher.BeginInvoke(() =>
                         {
                             ProgressBar.IsIndeterminate = false;
-                            // Show time as status (could be enhanced with duration calculation)
-                            ProgressBar.ToolTip = timeMatch.Value;
+                            ProgressBar.ToolTip = status;
+                            StatusTextBlock.Text = status;
                         }, System.Windows.Threading.DispatcherPriority.Background);
                     }
                 }
@@ -299,7 +402,13 @@ namespace MkvBitrateChanger
 
         private void AppendLog(string text)
         {
-            LogTextBox.AppendText(text + Environment.NewLine);
+            logLines.Enqueue(text);
+            while (logLines.Count > MaxLogLines)
+            {
+                logLines.Dequeue();
+            }
+
+            LogTextBox.Text = string.Join(Environment.NewLine, logLines) + Environment.NewLine;
             LogTextBox.ScrollToEnd();
         }
     }
