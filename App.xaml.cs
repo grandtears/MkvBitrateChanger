@@ -1,5 +1,3 @@
-﻿using System.Configuration;
-using System.Data;
 using System.Windows;
 
 namespace ChangeBitRateFroMkv
@@ -9,6 +7,10 @@ namespace ChangeBitRateFroMkv
     /// </summary>
     public partial class App : Application
     {
+        public App()
+        {
+            System.Windows.Media.RenderOptions.ProcessRenderMode = System.Windows.Interop.RenderMode.SoftwareOnly;
+        }
     }
 
 }
